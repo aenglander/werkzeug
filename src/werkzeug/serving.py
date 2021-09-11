@@ -11,6 +11,13 @@ It provides features like interactive debugging and code reloading. Use
     from myapp import create_app
     from werkzeug import run_simple
 """
+try:  # h11 support is optional
+    import h11
+
+    # raise ImportError
+except ImportError:
+    h11 = None
+
 import io
 import os
 import platform
@@ -18,11 +25,13 @@ import signal
 import socket
 import socketserver
 import sys
+import types
 import typing as t
 import warnings
 from datetime import datetime as dt
 from datetime import timedelta
 from datetime import timezone
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 
@@ -366,12 +375,226 @@ class WSGIRequestHandler(BaseHTTPRequestHandler):
         """
 
     def handle_one_request(self) -> None:
-        """Handle a single HTTP request."""
-        self.raw_requestline = self.rfile.readline()
-        if not self.raw_requestline:
+        """Handle a single HTTP request.
+
+        You normally don't need to override this method; see the class
+        __doc__ string for information on how to handle specific HTTP
+        commands such as GET and POST.
+
+        """
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            self._parse_request_line()
+            if h11 is not None and self.request_version == "HTTP/1.1":
+                self._handle_one_one_dot_one_request()
+            else:
+                if self.parse_request():
+                    self.run_wsgi()
+            self.wfile.flush()  # actually send the response if not already done.
+        except socket.timeout as e:
+            # a read or a write timed out.  Discard this connection
+            self.log_error("Request timed out: %r", e)
             self.close_connection = True
-        elif self.parse_request():
-            self.run_wsgi()
+
+    def _handle_one_one_dot_one_request(self) -> None:
+        """Handle a single HTTP request.
+
+        You normally don't need to override this method; see the class
+        __doc__ string for information on how to handle specific HTTP
+        commands such as GET and POST.
+
+        """
+        ExcInfo = t.NewType(
+            "ExcInfo", t.Tuple[t.Type, BaseException, types.TracebackType]
+        )
+        Headers = t.NewType(
+            "Headers", t.Union[t.List[t.Tuple[str, str]], t.List[t.Tuple[bytes, bytes]]]
+        )
+        import email
+        from wsgiref.handlers import format_date_time
+
+        class StartResponseHandler:
+            def __init__(self):
+                self.__status: t.Optional[str] = None
+                self.__headers: t.Optional[Headers] = None
+                self.__exc_info: t.Optional[ExcInfo]
+
+            def __call__(self, status: str, response_headers: Headers, exc_info=None):
+                # TODO: validate this method is called only once unless exc info is
+                #       provided
+
+                # TODO: validate status
+                self.__status = status
+
+                # TODO: validate headers
+                self.__headers = response_headers
+
+                # TODO: validate exc info
+                self.__exc_info = exc_info
+
+            @property
+            def status(self) -> str:
+                # TODO: Handle status not set
+                return self.__status
+
+            @property
+            def headers(self) -> Headers:
+                # TODO: Handle headers not set
+                return self.__headers
+
+        def generate_response(
+            http_version: bytes,
+            status_code: int,
+            reason: bytes,
+            headers: Headers = None,
+        ) -> "h11.Response":
+            if headers is None:
+                headers = list()
+
+            headers += [
+                (b"Date", format_date_time(None).encode("ascii")),
+                (b"Server", self.version_string()),
+            ]
+            response = h11.Response(
+                http_version=http_version,
+                headers=headers,
+                status_code=status_code,
+                reason=reason,
+            )
+            return response
+
+        try:
+            h11_server = h11.Connection(h11.SERVER)
+            h11_server.receive_data(self.raw_requestline)
+            while True:
+                try:
+                    event = h11_server.next_event()
+                except h11.RemoteProtocolError as rpe:
+                    self.send_error(rpe.error_status_hint)
+                    break
+
+                if type(event) is h11.ConnectionClosed:
+                    self.close_connection = True
+                    break
+                if type(event) is h11.PAUSED:
+                    h11_server.start_next_cycle()
+                if type(event) is h11.NEED_DATA:
+                    self.raw_request_line = self.rfile.readline(65537)
+                    h11_server.receive_data(self.raw_request_line)
+                if type(event) is h11.Request:
+                    self.headers = email.message.Message()
+                    for header in event.headers:
+                        self.headers.add_header(
+                            header[0].decode("iso-8859-1"),
+                            header[1].decode("iso-8859-1"),
+                        )
+
+                    environ = self.make_environ()
+                    response_handler = StartResponseHandler()
+                    response_body = self.server.app(environ, response_handler)
+                    status_code_str, reason = response_handler.status.split(" ", 1)
+                    status_code = int(status_code_str)
+                    h11_response = generate_response(
+                        event.http_version,
+                        status_code,
+                        reason,
+                        response_handler.headers,
+                    )
+                    response_heading = h11_server.send(h11_response)
+                    self.wfile.write(response_heading)
+                    for response_body_segment in response_body:
+                        if type(response_body_segment) is str:
+                            response_body_segment = response_body_segment.decode("utf8")
+                        h11_segment = h11.Data(data=response_body_segment)
+                        if h11.ERROR in h11_server.states:
+                            continue
+                        data_segment = h11_server.send(h11_segment)
+                        self.wfile.write(data_segment)
+                    if h11.ERROR in h11_server.states:
+                        continue
+                    response_footer = h11_server.send(h11.EndOfMessage())
+                    self.wfile.write(response_footer)
+                    self.wfile.flush()  # transmit the response if not already done.
+                    self.log_request(status_code)
+        except socket.timeout as e:
+            # a read or a write timed out.  Discard this connection
+            self.log_error("Request timed out: %r", e)
+            self.close_connection = True
+            return
+
+    def _parse_request_line(self):
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                # RFC 2145 section 3.1 says there can be only one "." and
+                #   - major and minor numbers MUST be treated as
+                #      separate integers;
+                #   - HTTP/2.4 is a lower version than HTTP/2.13, which in
+                #      turn is lower than HTTP/12.3;
+                #   - Leading zeros MUST be ignored by recipients.
+                if len(version_number) != 2:
+                    raise ValueError
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST, "Bad request version (%r)" % version
+                )
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(
+                    HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                    "Invalid HTTP version (%s)" % base_version_number,
+                )
+                return False
+            self.request_version = version
+
+        if not 2 <= len(words) <= 3:
+            self.send_error(
+                HTTPStatus.BAD_REQUEST, "Bad request syntax (%r)" % requestline
+            )
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST, "Bad HTTP/0.9 request type (%r)" % command
+                )
+                return False
+        self.command, self.path = command, path
+
+    # def handle_one_request(self) -> None:
+    #     """Handle a single HTTP request."""
+    #     self.raw_requestline = self.rfile.readline()
+    #     if not self.raw_requestline:
+    #         self.close_connection = True
+    #     elif self.parse_request():
+    #         self.run_wsgi()
 
     def send_response(self, code: int, message: t.Optional[str] = None) -> None:
         """Send the response header and log the response code."""

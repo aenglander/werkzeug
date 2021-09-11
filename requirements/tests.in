@@ -4,3 +4,4 @@ pytest-xprocess
 cryptography
 greenlet
 watchdog
+h11

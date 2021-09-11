@@ -4,5 +4,5 @@ from setuptools import setup
 setup(
     name="Werkzeug",
     install_requires=["dataclasses; python_version < '3.7'"],
-    extras_require={"watchdog": ["watchdog"]},
+    extras_require={"watchdog": ["watchdog"], "httpx": ["h11"]},
 )
